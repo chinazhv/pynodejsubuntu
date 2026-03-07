@@ -6,7 +6,7 @@
   "repository": "",
   "license": "MIT",
   "private": false,
-  "main": "app.js",
+  "main": "index.js",
   "scripts": {
     "dev": "node --expose-gc app.js",
     "start": "node --expose-gc app.js",
