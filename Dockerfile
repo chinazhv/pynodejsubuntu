@@ -9,6 +9,9 @@ ENV TZ=Asia/Shanghai \
 # ENV ROOT_PASSWORD=your_secure_password  # 1. 新增：定义root密码环境变量（建议后续用secret管理）
 # 注意：这个敏感信息建议用secret管理，仅保留适配你的原有配置
 
+# 解决 Kaniko apt sandbox 问题
+RUN echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/no-sandbox
+
 COPY entrypoint.sh /entrypoint.sh
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY reboot.sh /usr/local/sbin/reboot
