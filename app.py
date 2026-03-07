@@ -61,7 +61,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
             # 仅针对 HEAD 请求返回 200 OK 状态码，不包含任何 Body
-            if request.method == 'HEAD':
+            if self.method == 'HEAD':
                 return web.Response(status=200)
                 
             self.send_response(200)
@@ -79,9 +79,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self.wfile.write(b'Make world Peace!')
 
-        elif request.path == '/healthz':
+        elif self.path == '/healthz':
             # 仅针对 HEAD 请求返回 200 OK 状态码，不包含任何 Body
-            if request.method == 'HEAD':
+            if self.method == 'HEAD':
                 return web.Response(status=200)
 
             # 兼容性处理：防止某些运维工具偶尔发 GET 请求（可选）
