@@ -76,7 +76,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b'Make world Peace!')
 
         elif request.path == '/healthz':
-            # 只要代码能执行到这里，说明服务还在处理请求
+            # 仅针对 HEAD 请求返回 200 OK 状态码，不包含任何 Body
+            if request.method == 'HEAD':
+                return web.Response(status=200)
+
+            # 兼容性处理：防止某些运维工具偶尔发 GET 请求（可选）
             return web.Response(text='OK', content_type='text/plain', status=200)
         
         elif self.path == f'/{SUB_PATH}':
