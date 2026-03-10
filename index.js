@@ -1,63 +1,581 @@
-const express = require("express");
-const path = require("path");
+const http = require('http');
+const net = require('net');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer, createWebSocketStream } = require('ws');
+const crypto = require('crypto');
+const dns = require('dns').promises;
 
-const app = express();
+// ==========================================
+// 1. 全局配置
+// ==========================================
 
-const PORT = process.env.SERVER_PORT || process.env.PORT || 8000;
+const DEFAULT_UUID = 'b389e09c-4e31-40da-a56c-433f507e615a';
+const UUID = (process.env.UUID || DEFAULT_UUID).trim();
+const PORT = parseInt(process.env.PORT || '56818', 10);
+const WSPATH = process.env.WSPATH || UUID.substring(0, 8);
 
-// 如果在 Cloudflare / Nginx 后
-app.set("trust proxy", true);
+const xhttpSessions = new Map();
 
-
-// 当前目录
-const PUBLIC_DIR = __dirname;
-
-
-// 静态资源
-app.use(express.static(PUBLIC_DIR));
-
-
-// 根路由
-app.get("/", (req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
-});
-
-
-// 健康检查
-app.route("/health")
-  .get((req, res) => {
-    res.json({
-      status: "ok",
-      time: new Date().toISOString(),
-      ip: req.ip
-    });
-  })
-  .head((req, res) => {
-    res.status(204).end();
-  });
-
-
-// 启动服务器
-const server = app.listen(PORT, () => {
-  console.log(`HTTP server running on port: ${PORT}`);
-});
-
-
-// 启动错误
-server.on("error", (err) => {
-  console.error("Server start error:", err);
-  process.exit(1);
-});
-
-
-// 优雅退出
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-function shutdown() {
-  console.log("Shutting down server...");
-  server.close(() => {
-    console.log("Server closed");
-    process.exit(0);
-  });
+// 日志工具 (已静默)
+function log(...args) {
+    // const time = new Date().toISOString().substring(11, 19);
+    // console.log(`[${time}]`, ...args);
 }
+
+// ==========================================
+// 2. 辅助函数
+// ==========================================
+
+async function resolveHost(host) {
+    const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    if (ipRegex.test(host)) return host;
+    try {
+        const { address } = await dns.lookup(host, { family: 4 });
+        return address;
+    } catch (e) {
+        return host;
+    }
+}
+
+function setupXhttpResponse(res) {
+    if (!res.headersSent) {
+        res.writeHead(200, {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Content-Type': 'application/octet-stream',
+            'Connection': 'keep-alive',
+            'Pragma': 'no-cache',
+            'Transfer-Encoding': 'chunked'
+        });
+        if (res.flushHeaders) res.flushHeaders();
+    }
+    if (res.socket) res.socket.setNoDelay(true);
+}
+
+// ==========================================
+// 3. 服务核心
+// ==========================================
+
+// const fs = require("fs");
+// const path = require("path");
+
+const server = http.createServer((req, res) => {
+    req.setTimeout(0); 
+
+    // 首页
+    if (req.url === '/' || req.url === '/index.html') {
+        const file = path.join(__dirname, "index.html");
+
+        fs.readFile(file, (err, data) => {
+            if (err) {
+                res.writeHead(500);
+                res.end("index.html error");
+                return;
+            }
+
+            res.writeHead(200, {'Content-Type': 'text/html'});
+            res.end(data);
+        });
+        return;
+    }
+
+    if (req.url === '/debug_network') {
+        handleDebugNetwork(res);
+        return;
+    }
+
+    if (req.url.startsWith(`/${WSPATH}`)) {
+        const pathPart = req.url.split('?')[0]; 
+        const parts = pathPart.split('/');
+        let sessionId = parts[2]; 
+
+        if (!sessionId || sessionId.trim() === '') {
+            sessionId = `stream-none-${crypto.randomUUID()}`;
+        }
+
+        if (req.method === 'GET') {
+            handleXhttpGet(req, res, sessionId);
+        } else {
+            handleXhttpPost(req, res, sessionId);
+        }
+        return;
+    }
+
+    // ===== 静态资源处理 =====
+    const safePath = path.normalize(req.url).replace(/^(\.\.[\/\\])+/, '');
+    const filePath = path.join(__dirname, safePath);
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+
+        const ext = path.extname(filePath).toLowerCase();
+
+        const mime = {
+            ".html":"text/html",
+            ".js":"application/javascript",
+            ".css":"text/css",
+            ".json":"application/json",
+            ".png":"image/png",
+            ".jpg":"image/jpeg",
+            ".jpeg":"image/jpeg",
+            ".gif":"image/gif",
+            ".svg":"image/svg+xml",
+            ".ico":"image/x-icon",
+            ".woff":"font/woff",
+            ".woff2":"font/woff2",
+            ".txt":"text/plain"
+        };
+
+        const contentType = mime[ext] || "application/octet-stream";
+
+        res.writeHead(200, { "Content-Type": contentType });
+
+        const stream = fs.createReadStream(filePath);
+        stream.pipe(res);
+
+        stream.on("error", () => {
+            res.writeHead(500);
+            res.end();
+        });
+
+        return;
+    }
+
+    // 默认404
+    res.writeHead(404);
+    res.end();
+});
+
+server.on('checkContinue', (req, res) => {
+    res.writeContinue();
+    server.emit('request', req, res);
+});
+
+// ==========================================
+// 4. XHTTP 逻辑核心 (Ack & Divert)
+// ==========================================
+
+function tryWrite(res, chunk) {
+    if (!res || res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) {
+        return false;
+    }
+    try {
+        res.write(chunk);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function sendDownlinkData(sessionId, chunk, isHandshake = false) {
+    const session = xhttpSessions.get(sessionId);
+    if (!session) return;
+
+    let sent = false;
+
+    // 1. 优先尝试 GET (Stream-Up, Packet-Up, Auto)
+    if (tryWrite(session.downloadRes, chunk)) {
+        sent = true;
+    }
+    
+    // 2. 如果没有 GET (Stream-None)，或者 GET 写失败，尝试 POST
+    if (!sent) {
+        if (tryWrite(session.postRes, chunk)) {
+            sent = true;
+        }
+    }
+
+    // 3. 失败缓冲
+    if (!sent) {
+        session.buffer.push({ chunk, isHandshake });
+    }
+}
+
+function flushBuffer(session) {
+    if (session.buffer.length > 0) {
+        const temp = [...session.buffer];
+        session.buffer = [];
+        const sId = [...xhttpSessions.entries()].find(([k,v]) => v === session)?.[0];
+        if (sId) {
+            temp.forEach(item => {
+                if (Buffer.isBuffer(item)) sendDownlinkData(sId, item, false);
+                else sendDownlinkData(sId, item.chunk, item.isHandshake);
+            });
+        }
+    }
+}
+
+function handleXhttpGet(req, res, sessionId) {
+    setupXhttpResponse(res);
+    let session = xhttpSessions.get(sessionId);
+    if (!session) {
+        session = createSession(sessionId);
+        session.state = 'IDLE';
+    }
+    session.downloadRes = res;
+    flushBuffer(session);
+    
+    const cleanup = () => { if(session.downloadRes === res) session.downloadRes = null; };
+    res.on('close', cleanup);
+    req.on('error', cleanup);
+}
+
+function handleXhttpPost(req, res, sessionId) {
+    setupXhttpResponse(res);
+
+    // 识别模式
+    const hasContentLength = req.headers['content-length'] !== undefined;
+    
+    let session = xhttpSessions.get(sessionId);
+    
+    if (!session) {
+        // Stream-None 或者是 Packet 模式的第一包(但 GET 还没到)
+        session = createSession(sessionId);
+        session.state = 'CONNECTING';
+        session.postRes = res;
+        processNewHandshake(req, sessionId, session);
+    } else {
+        // 已存在会话
+        session.postRes = res;
+        
+        // 【核心策略】Ack & Divert
+        // 如果我们有 GET 通道 (downloadRes)，并且这是一个 Packet 请求 (Content-Length)
+        // 说明数据应该走 GET，而当前的 POST 只是用来上传的，必须立即由服务端 Ack 结束
+        if (session.downloadRes && hasContentLength) {
+            req.on('end', () => {
+                if (!res.writableEnded) {
+                    res.end();
+                }
+            });
+        }
+        
+        flushBuffer(session);
+
+        if (session.state === 'ESTABLISHED') {
+            if (session.target) req.pipe(session.target, { end: false });
+        
+        } else if (session.state === 'CONNECTING') {
+            session.pendingUplinks.push(req);
+        
+        } else if (session.state === 'IDLE') {
+            session.state = 'CONNECTING';
+            processNewHandshake(req, sessionId, session);
+        }
+    }
+
+    res.on('close', () => { 
+        if (session && session.postRes === res) session.postRes = null; 
+    });
+    req.on('error', () => {});
+}
+
+function processNewHandshake(req, sessionId, session) {
+    req.once('data', async (firstChunk) => {
+        req.pause();
+        try {
+            if (session.target) {
+                session.target.write(firstChunk);
+                req.pipe(session.target, { end: false });
+                req.resume();
+                return;
+            }
+
+            let success = false;
+            
+            if (firstChunk.length >= 17 && firstChunk[0] === 0x00) {
+                log(`[XHTTP] Session: ${sessionId} (VLESS)`);
+                success = await handleProxyProtocol(req, sessionId, firstChunk, 'vless');
+            } else if (firstChunk.length >= 58) {
+                success = await handleProxyProtocol(req, sessionId, firstChunk, 'trojan');
+                if(success) log(`[XHTTP] Session: ${sessionId} (Trojan)`);
+            } else {
+                log(`[XHTTP] Unknown Hex`);
+            }
+
+            if (!success) cleanupSession(sessionId, 'Protocol Error');
+
+        } catch (e) {
+            log(`[XHTTP] Error: ${e.message}`);
+            cleanupSession(sessionId, 'Error');
+        }
+    });
+}
+
+
+function createSession(id) {
+    const s = { 
+        downloadRes: null, postRes: null, target: null, 
+        buffer: [], state: 'IDLE', pendingUplinks: []
+    };
+    xhttpSessions.set(id, s);
+    setTimeout(() => {
+        const c = xhttpSessions.get(id);
+        if (c && !c.target && c.state !== 'ESTABLISHED') cleanupSession(id, 'Timeout');
+    }, 60000);
+    return s;
+}
+
+function cleanupSession(id, reason) {
+    if (xhttpSessions.has(id)) {
+        const s = xhttpSessions.get(id);
+        setTimeout(() => {
+            if (reason === 'Target Closed' || reason === 'Target Error' || reason === 'Protocol Error' || reason === 'Error') {
+                if (s.target && !s.target.destroyed) s.target.destroy();
+                if (s.downloadRes && !s.downloadRes.writableEnded) s.downloadRes.end();
+                if (s.postRes && !s.postRes.writableEnded) s.postRes.end();
+                s.pendingUplinks.forEach(r => r.destroy());
+                xhttpSessions.delete(id);
+            }
+        }, 500);
+    }
+}
+
+// async function handleDebugNetwork(res) {
+    // res.writeHead(200, {'Content-Type':'application/json'}); 
+    // res.end(JSON.stringify({status: 'ok'}));
+    
+// }
+
+const https = require('https');
+
+async function handleDebugNetwork(res) {
+    try {
+        // 获取完整的 IP 信息
+        const ipDetails = await getIPFullDetails();
+        
+        // 构造包含所有完善信息的响应数据
+        const responseData = {
+            status: 'ok',
+            isp: ipDetails.isp || 'Unknown ISP',
+            country: ipDetails.country || 'Unknown Country', // 国家信息
+            cloud_provider: ipDetails.cloudProvider || 'Unknown Cloud Provider', // 云服务商
+            ip_type: ipDetails.ipType || 'Unknown IP Type', // IP类型（数据中心/家宽）
+            risk_score: ipDetails.riskScore || 50 // 风险评分（0-100）
+        };
+
+        res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8'
+        });
+        res.end(JSON.stringify(responseData, null, 2)); // 格式化JSON，便于阅读
+    } catch (error) {
+        console.error('获取 IP 信息失败：', error.message);
+        // 异常时返回所有字段的兜底值
+        res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8'
+        });
+        res.end(JSON.stringify({
+            status: 'ok',
+            isp: 'Unknown ISP',
+            country: 'Unknown Country',
+            cloud_provider: 'Unknown Cloud Provider',
+            ip_type: 'Unknown IP Type',
+            risk_score: 50
+        }, null, 2));
+    }
+}
+
+// 获取完整的 IP 详情（含国家、云服务商、IP类型、风险评分）
+async function getIPFullDetails() {
+    return new Promise((resolve) => {
+        // 请求 ipinfo.io 获取基础 IP 信息
+        const request = https.get('https://ipinfo.io/json', (response) => {
+            let data = '';
+
+            response.on('data', (chunk) => {
+                data += chunk;
+            });
+
+            response.on('end', () => {
+                try {
+                    const result = JSON.parse(data);
+                    // 解析基础信息
+                    const baseInfo = {
+                        isp: result.org ? result.org.trim() : null,
+                        country: result.country ? result.country.trim() : null // 国家代码（如CN/US），如需中文可额外映射
+                    };
+
+                    // 识别云服务商（基于 ISP/ASN 特征）
+                    const cloudProvider = identifyCloudProvider(baseInfo.isp);
+                    // 识别 IP 类型（数据中心/家宽/企业）
+                    const ipType = identifyIPType(baseInfo.isp, cloudProvider);
+                    // 计算风险评分
+                    const riskScore = calculateRiskScore(ipType, cloudProvider);
+
+                    // 整合所有信息
+                    resolve({
+                        ...baseInfo,
+                        cloudProvider,
+                        ipType,
+                        riskScore
+                    });
+                } catch (parseError) {
+                    // 解析失败返回空对象（后续会用兜底值）
+                    resolve({});
+                }
+            });
+        });
+
+        // 网络错误/超时处理
+        request.on('error', () => resolve({}));
+        request.setTimeout(5000, () => {
+            request.destroy();
+            resolve({});
+        });
+    });
+}
+
+// 识别云服务商（基于 ISP 关键词匹配）
+function identifyCloudProvider(isp) {
+    if (!isp) return null;
+
+    const cloudKeywords = {
+        '阿里云': ['Alibaba', 'Aliyun', 'AS45102'],
+        '腾讯云': ['Tencent', 'AS45090'],
+        '华为云': ['Huawei', 'AS137548'],
+        'AWS': ['Amazon', 'AWS', 'AS16509'],
+        'Google Cloud': ['Google Cloud', 'AS396982'],
+        'Azure': ['Microsoft Azure', 'AS8075'],
+        '百度云': ['Baidu', 'AS38803'],
+        '京东云': ['JD Cloud', 'AS4837'],
+        'Latitude.sh': ['Latitude.sh', 'AS396356']
+    };
+
+    // 遍历匹配云服务商
+    for (const [provider, keywords] of Object.entries(cloudKeywords)) {
+        if (keywords.some(keyword => isp.includes(keyword))) {
+            return provider;
+        }
+    }
+    return null; // 非云服务商返回null
+}
+
+// 识别 IP 类型：DataCenter（数据中心）/Residential（家宽）/Enterprise（企业）
+function identifyIPType(isp, cloudProvider) {
+    if (!isp) return null;
+
+    // 云服务商 IP 直接判定为数据中心
+    if (cloudProvider) return 'DataCenter';
+
+    // 家宽关键词匹配（国内运营商）
+    const residentialKeywords = ['China Mobile', 'China Unicom', 'China Telecom', '中国移动', '中国联通', '中国电信', 'Residential'];
+    if (residentialKeywords.some(keyword => isp.includes(keyword))) {
+        return 'Residential';
+    }
+
+    // 其他情况判定为企业 IP
+    return 'Enterprise';
+}
+
+// 计算风险评分（0-100，分数越高风险越高）
+function calculateRiskScore(ipType, cloudProvider) {
+    // 数据中心 IP（云服务商）风险最高
+    if (ipType === 'DataCenter') return 80;
+    // 企业 IP 风险中等
+    if (ipType === 'Enterprise') return 40;
+    // 家宽 IP 风险最低
+    if (ipType === 'Residential') return 10;
+    // 兜底评分
+    return 50;
+}
+
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
+});
+wss.on('connection', (ws, req) => {
+    const wsStream = createWebSocketStream(ws);
+    wsStream.once('data', async (firstChunk) => {
+        wsStream.pause();
+        let success = false;
+        if (firstChunk.length >= 17 && firstChunk[0] === 0x00) success = await handleProxyProtocol(wsStream, null, firstChunk, 'vless');
+        else if (firstChunk.length >= 58) success = await handleProxyProtocol(wsStream, null, firstChunk, 'trojan');
+        if (!success) ws.close();
+    });
+});
+
+async function handleProxyProtocol(inputStream, sessionId, firstChunk, type) {
+    let cursor = 0; let host = ''; let port = 0; let initialPayloadCursor = 0;
+    const localUUIDBuffer = Buffer.from(UUID.replace(/-/g, ''), 'hex');
+
+    if (type === 'vless') {
+        const reqUUID = firstChunk.subarray(1, 17);
+        if (!reqUUID.equals(localUUIDBuffer)) return false;
+        cursor = 17; const optLen = firstChunk[cursor]; cursor += 1 + optLen + 1;
+        port = firstChunk.readUInt16BE(cursor); cursor += 2;
+        const atyp = firstChunk[cursor]; cursor += 1;
+        if (atyp === 1) { host = firstChunk.subarray(cursor, cursor + 4).join('.'); cursor += 4; }
+        else if (atyp === 2) { const domainLen = firstChunk[cursor]; cursor += 1; host = firstChunk.subarray(cursor, cursor + domainLen).toString('utf8'); cursor += domainLen; }
+        else if (atyp === 3) { cursor += 16; host = "ipv6"; } else return false;
+        initialPayloadCursor = cursor;
+    } else if (type === 'trojan') {
+        const reqHash = firstChunk.subarray(0, 56).toString('utf8');
+        const localHash = crypto.createHash('sha224').update(UUID).digest('hex');
+        if (reqHash.toLowerCase() !== localHash.toLowerCase()) return false;
+        cursor = 56;
+        if (firstChunk[cursor] === 0x0d && firstChunk[cursor + 1] === 0x0a) cursor += 2;
+        if (firstChunk[cursor] !== 0x01) return false; cursor += 2; 
+        if (firstChunk[cursor-1] === 1) { host = firstChunk.subarray(cursor, cursor + 4).join('.'); cursor += 4; }
+        else if (firstChunk[cursor-1] === 3) { const domainLen = firstChunk[cursor]; cursor += 1; host = firstChunk.subarray(cursor, cursor + domainLen).toString('utf8'); cursor += domainLen; }
+        else if (firstChunk[cursor-1] === 4) { cursor += 16; host = "ipv6"; } else return false;
+        port = firstChunk.readUInt16BE(cursor); cursor += 2;
+        if (firstChunk.length >= cursor + 2 && firstChunk[cursor] === 0x0d && firstChunk[cursor + 1] === 0x0a) cursor += 2;
+        initialPayloadCursor = cursor;
+    }
+
+    const targetIP = await resolveHost(host);
+    const tcpSocket = net.connect(port, targetIP);
+    tcpSocket.setNoDelay(true);
+
+    if (sessionId) {
+        const s = xhttpSessions.get(sessionId);
+        if (s) s.target = tcpSocket;
+    }
+
+    tcpSocket.on('connect', () => {
+        if (type === 'vless') {
+            const header = Buffer.from([0x00, 0x00]);
+            if (sessionId) sendDownlinkData(sessionId, header, true); 
+            else inputStream.write(header);
+        }
+
+        if (sessionId) {
+            const s = xhttpSessions.get(sessionId);
+            if (s) {
+                s.state = 'ESTABLISHED';
+                while (s.pendingUplinks.length > 0) {
+                    s.pendingUplinks.shift().pipe(tcpSocket, { end: false });
+                }
+            }
+        }
+
+        if (initialPayloadCursor < firstChunk.length) tcpSocket.write(firstChunk.subarray(initialPayloadCursor));
+
+        inputStream.resume();
+        const pipeOpts = sessionId ? { end: false } : { end: true };
+        inputStream.pipe(tcpSocket, pipeOpts);
+
+        if (sessionId) {
+            tcpSocket.on('data', (c) => sendDownlinkData(sessionId, c, false));
+        } else {
+            tcpSocket.pipe(inputStream);
+        }
+    });
+
+    tcpSocket.on('error', (e) => {
+        if (sessionId) cleanupSession(sessionId, 'Target Error');
+        else try{inputStream.destroy()}catch(e){}
+    });
+    tcpSocket.on('close', () => {
+        if (sessionId) cleanupSession(sessionId, 'Target Closed');
+        else try{inputStream.destroy()}catch(e){}
+    });
+
+    return true;
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`========================================`);
+    console.log(`NodeJS Server Started`);
+    // console.log(`Port: ${PORT}`);
+    console.log(`========================================`);
+
+});
