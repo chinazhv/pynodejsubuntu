@@ -74,10 +74,7 @@ RUN pip3 install --no-cache-dir -r /requirements.txt
 # ===============================
 # 端口
 # ===============================
-EXPOSE 22
 EXPOSE 3000
-EXPOSE 8000
-
 
 ENTRYPOINT ["/entrypoint.sh"]
 
