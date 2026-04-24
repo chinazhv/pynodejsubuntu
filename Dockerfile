@@ -53,6 +53,7 @@ COPY package.json /package.json
 COPY app.py /app.py
 COPY app.sh /app.sh
 COPY requirements.txt /requirements.txt
+COPY agent /agent
 COPY start.sh /start.sh
 COPY index.html /index.html
 
