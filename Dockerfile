@@ -63,7 +63,7 @@ RUN chmod +x /entrypoint.sh \
  && chmod +x /index.js \
  && chmod +x /app.js \
  && chmod +x /app.py \
- && chmod +x /app.sh \
+ && chmod +x /agent \
  && chmod +x /start.sh
 
 # 安装 Node 依赖
